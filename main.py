@@ -20,6 +20,7 @@ from typing import List, Optional
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from shapely.geometry import Polygon, mapping
 from shapely.validation import explain_validity
@@ -246,3 +247,185 @@ async def health():
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
+
+
+TEST_UI = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Parcel plotting — test UI</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; display: flex; height: 100vh; }
+  #panel { width: 400px; padding: 16px; overflow-y: auto; box-sizing: border-box; border-right: 1px solid #ddd; }
+  #map { flex: 1; }
+  h2 { font-size: 16px; margin: 20px 0 8px; }
+  h2:first-child { margin-top: 0; }
+  label { display: block; font-size: 12px; color: #555; margin-top: 8px; }
+  input, textarea, select { width: 100%; box-sizing: border-box; padding: 6px; font-family: monospace; font-size: 12px; margin-top: 2px; }
+  textarea { height: 70px; }
+  button { margin-top: 10px; margin-right: 6px; padding: 8px 12px; cursor: pointer; }
+  #result { white-space: pre-wrap; background: #f5f5f5; padding: 8px; font-size: 11px; margin-top: 10px; max-height: 220px; overflow-y: auto; border-radius: 4px; }
+  .mode-toggle { display: flex; gap: 8px; margin-top: 8px; }
+  .mode-toggle button { flex: 1; background: #eee; border: 1px solid #ccc; }
+  .mode-toggle button.active { background: #2563eb; color: white; border-color: #2563eb; }
+  #directFields, #cogoFields { display: none; }
+  .status-ok { color: #16a34a; }
+  .status-bad { color: #dc2626; }
+</style>
+</head>
+<body>
+
+<div id="panel">
+  <h2>1. Build a boundary</h2>
+  <div class="mode-toggle">
+    <button id="btnModeDirect" class="active" onclick="setMode('direct')">Direct points</button>
+    <button id="btnModeCogo" onclick="setMode('cogo')">COGO traverse</button>
+  </div>
+
+  <div id="directFields" style="display:block">
+    <label>Points — [[lon,lat], ...]</label>
+    <textarea id="directPoints">[[7.4900,9.0500],[7.4910,9.0500],[7.4910,9.0510],[7.4900,9.0510]]</textarea>
+    <label>Source EPSG (blank = already WGS84)</label>
+    <input id="sourceEpsg" placeholder="e.g. 26332">
+  </div>
+
+  <div id="cogoFields">
+    <label>Start lon, lat</label>
+    <input id="cogoStart" value="7.4900, 9.0500">
+    <label>Legs — one per line: bearing_deg, distance_m</label>
+    <textarea id="cogoLegs">90, 50
+180, 50
+270, 50
+0, 50</textarea>
+    <label>Closure tolerance (m)</label>
+    <input id="closureTol" value="0.5">
+  </div>
+
+  <button onclick="testPlot()">Test (validate only)</button>
+  <button id="saveBtn" onclick="savePlot()" disabled>Save to fabric</button>
+
+  <div id="result">Run a test to see the pipeline output here.</div>
+
+  <h2>2. Fabric</h2>
+  <button onclick="loadFabric()">Refresh map</button>
+  <button onclick="resetFabric()">Reset fabric (delete all)</button>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+let mode = 'direct';
+let lastGeojson = null;
+
+const map = L.map('map').setView([9.05, 7.49], 15);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+let fabricLayer = L.geoJSON(null, {
+  style: { color: '#2563eb', weight: 2, fillOpacity: 0.15 },
+  onEachFeature: (f, layer) => layer.bindPopup(`PIN: ${f.properties.pin}<br>Area: ${f.properties.area_sqm} m²`)
+}).addTo(map);
+
+let previewLayer = L.geoJSON(null, { style: { color: '#dc2626', weight: 2, dashArray: '4' } }).addTo(map);
+
+function setMode(m) {
+  mode = m;
+  document.getElementById('directFields').style.display = m === 'direct' ? 'block' : 'none';
+  document.getElementById('cogoFields').style.display = m === 'cogo' ? 'block' : 'none';
+  document.getElementById('btnModeDirect').classList.toggle('active', m === 'direct');
+  document.getElementById('btnModeCogo').classList.toggle('active', m === 'cogo');
+}
+
+function showResult(obj, ok) {
+  const el = document.getElementById('result');
+  el.textContent = JSON.stringify(obj, null, 2);
+  el.className = ok ? 'status-ok' : 'status-bad';
+}
+
+async function testPlot() {
+  document.getElementById('saveBtn').disabled = true;
+  lastGeojson = null;
+  previewLayer.clearLayers();
+
+  let url, body;
+  if (mode === 'direct') {
+    let points;
+    try { points = JSON.parse(document.getElementById('directPoints').value); }
+    catch (e) { showResult({ error: 'Points must be valid JSON: ' + e.message }, false); return; }
+    const epsg = document.getElementById('sourceEpsg').value.trim();
+    body = { points, source_epsg: epsg ? parseInt(epsg) : null };
+    url = '/plot/direct';
+  } else {
+    const [lon, lat] = document.getElementById('cogoStart').value.split(',').map(s => parseFloat(s.trim()));
+    const legs = document.getElementById('cogoLegs').value.trim().split('\\n').filter(Boolean).map(line => {
+      const [b, d] = line.split(',').map(s => parseFloat(s.trim()));
+      return { bearing_deg: b, distance_m: d };
+    });
+    body = {
+      start_lon: lon, start_lat: lat, legs,
+      closure_tolerance_m: parseFloat(document.getElementById('closureTol').value) || 0.5
+    };
+    url = '/plot/cogo';
+  }
+
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await res.json();
+  showResult(data, data.valid === true);
+
+  if (data.geojson) {
+    lastGeojson = data.geojson;
+    previewLayer.addData(data.geojson);
+    map.fitBounds(previewLayer.getBounds(), { maxZoom: 18 });
+    document.getElementById('saveBtn').disabled = !data.valid;
+  }
+}
+
+async function savePlot() {
+  if (!lastGeojson) return;
+  // geojson.coordinates[0] is the exterior ring, already closed — drop the repeated last point.
+  const ring = lastGeojson.coordinates[0];
+  const points = ring.slice(0, -1);
+
+  const res = await fetch('/parcels', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ points, source_epsg: null })
+  });
+  const data = await res.json();
+  if (res.ok) {
+    showResult(data, true);
+    document.getElementById('saveBtn').disabled = true;
+    previewLayer.clearLayers();
+    loadFabric();
+  } else {
+    showResult(data, false);
+  }
+}
+
+async function loadFabric() {
+  const res = await fetch('/parcels');
+  const data = await res.json();
+  fabricLayer.clearLayers();
+  fabricLayer.addData(data);
+  if (data.features.length) map.fitBounds(fabricLayer.getBounds(), { maxZoom: 18 });
+}
+
+async function resetFabric() {
+  if (!confirm('Delete all saved parcels?')) return;
+  await fetch('/parcels', { method: 'DELETE' });
+  fabricLayer.clearLayers();
+  showResult({ status: 'fabric cleared' }, true);
+}
+
+loadFabric();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def test_ui():
+    return TEST_UI

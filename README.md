@@ -4,19 +4,37 @@ Tests only the plotting pipeline: COGO/direct capture → coordinate transform �
 polygon build → topology validation (self-intersection + overlap) → PostGIS
 storage → GeoJSON out. Nothing else from GeoEstate/GeoCore.
 
+## Testing UI
+
+Open `https://<your-service>.up.railway.app/` directly — it's a self-contained
+test page (Leaflet map + form), no separate frontend to deploy:
+
+- Switch between **Direct points** and **COGO traverse** input.
+- **Test (validate only)** hits `/plot/direct` or `/plot/cogo` and draws the
+  candidate polygon in red without saving — use this to check closure,
+  self-intersection, and overlap before committing anything.
+- **Save to fabric** only enables once a test comes back valid, then posts to
+  `/parcels` and redraws the fabric in blue with its PIN and area in a popup.
+- **Reset fabric** wipes the table so you can re-run scenarios cleanly.
+
+`/docs` (Swagger UI) is still there if you want to hit the raw endpoints
+directly instead.
+
 ## Deploy on Railway, using Supabase as the database
 
 1. **Enable PostGIS on Supabase first**: Dashboard → Database → Extensions →
-   search "postgis" → enable. Do this before first deploy — the connection
-   role Supabase gives you for the app may not have `CREATE EXTENSION`
-   rights, so the app's own attempt to create it (on startup) is a no-op
-   fallback, not the primary path.
-2. **Get the connection string**: Dashboard → Project Settings → Database →
-   Connection string → URI. Use the **Session pooler** or **direct
-   connection** string (port 5432), not the transaction pooler (port 6543) —
-   this app opens/closes a fresh connection per request and doesn't handle
-   pooled prepared-statement restrictions. Append `?sslmode=require` if it's
-   not already in the string.
+   search "postgis" → enable.
+2. **Get the connection string — use the Session Pooler, not Direct
+   connection**: Dashboard → Project Settings → Database → Connection
+   string → select the **"Session pooler"** tab (not "Direct connection").
+   Supabase's direct connection host (`db.<project-ref>.supabase.co`)
+   resolves to an IPv6-only address, and Railway has no outbound IPv6
+   routing — connecting to it always fails with `OSError: Network is
+   unreachable`, no matter what the app code does. The Session Pooler host
+   (`aws-0-<region>.pooler.supabase.com:5432`) resolves over IPv4 and works
+   from Railway. Don't use the **Transaction Pooler** (port 6543) either —
+   it disables server-side prepared statements, which asyncpg relies on by
+   default.
 3. Create a Railway project, add this folder as a service (push to a GitHub
    repo, or `railway up` from the CLI in this folder — no Railway Postgres
    plugin needed since Supabase is the database).
