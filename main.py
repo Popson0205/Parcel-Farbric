@@ -41,7 +41,14 @@ def get_conn():
 def setup_db():
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+    try:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+        conn.commit()
+    except Exception as e:
+        # On Supabase, enable PostGIS via Database > Extensions in the dashboard
+        # if this role lacks CREATE EXTENSION rights — safe to ignore once enabled there.
+        conn.rollback()
+        print(f"Skipping CREATE EXTENSION (likely already enabled via dashboard): {e}")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS parcels (

@@ -4,17 +4,24 @@ Tests only the plotting pipeline: COGO/direct capture → coordinate transform �
 polygon build → topology validation (self-intersection + overlap) → PostGIS
 storage → GeoJSON out. Nothing else from GeoEstate/GeoCore.
 
-## Deploy on Railway
+## Deploy on Railway, using Supabase as the database
 
-1. Create a new Railway project.
-2. **Add a database**: "+ New" → "Database" → "PostgreSQL". Railway's Postgres
-   supports `CREATE EXTENSION postgis` out of the box — the app creates the
-   extension and table automatically on startup.
-3. **Add this service**: "+ New" → "GitHub Repo" (push this folder to a repo
-   first) or "Empty Service" + `railway up` from the CLI in this folder.
-4. In the service's **Variables** tab, click "Add Reference" and link the
-   Postgres plugin's `DATABASE_URL` — Railway wires this in automatically if
-   both are in the same project.
+1. **Enable PostGIS on Supabase first**: Dashboard → Database → Extensions →
+   search "postgis" → enable. Do this before first deploy — the connection
+   role Supabase gives you for the app may not have `CREATE EXTENSION`
+   rights, so the app's own attempt to create it (on startup) is a no-op
+   fallback, not the primary path.
+2. **Get the connection string**: Dashboard → Project Settings → Database →
+   Connection string → URI. Use the **Session pooler** or **direct
+   connection** string (port 5432), not the transaction pooler (port 6543) —
+   this app opens/closes a fresh connection per request and doesn't handle
+   pooled prepared-statement restrictions. Append `?sslmode=require` if it's
+   not already in the string.
+3. Create a Railway project, add this folder as a service (push to a GitHub
+   repo, or `railway up` from the CLI in this folder — no Railway Postgres
+   plugin needed since Supabase is the database).
+4. In the service's **Variables** tab, add `DATABASE_URL` manually, pasted
+   from step 2.
 5. Deploy. Railway detects `requirements.txt` + `Procfile` and builds it as a
    Python service.
 6. Once live, open `https://<your-service>.up.railway.app/docs` — FastAPI's

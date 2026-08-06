@@ -2,5 +2,5 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 psycopg2-binary==2.9.9
 shapely==2.0.6
-pyproj==3.6.1
+pyproj>=3.7.0
 pydantic==2.9.2
