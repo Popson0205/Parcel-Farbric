@@ -1,6 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-asyncpg==0.29.0
+asyncpg>=0.30.0
 shapely==2.0.6
 pyproj>=3.7.0
 pydantic==2.9.2
