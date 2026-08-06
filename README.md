@@ -86,6 +86,16 @@ frontend.
 curl -X DELETE https://<your-service>/parcels
 ```
 
+## Driver note
+
+This uses `asyncpg`, not `psycopg2`. `psycopg2-binary`'s wheel needs
+`libpq.so.5` at runtime, and Railway's build/runtime image split can drop
+that shared library, causing an `ImportError: libpq.so.5` crash after a
+successful build. `asyncpg` implements the Postgres wire protocol itself, no
+system library dependency, so this failure mode goes away entirely. Your
+Supabase connection string works as-is — asyncpg understands `sslmode` in
+the URL the same way libpq does.
+
 ## What this deliberately leaves out
 
 No auth, no organisations/projects, no PIN format beyond a counter, no

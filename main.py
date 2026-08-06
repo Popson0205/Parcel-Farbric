@@ -10,15 +10,15 @@ Tests ONLY the plotting pipeline from the GeoEstate blueprint:
       -> store in PostGIS with a PIN
       -> serve back as GeoJSON
 
-Deploy on Railway with a PostgreSQL (PostGIS-capable) plugin attached.
+Deploy on Railway. Uses asyncpg (no libpq system dependency) against
+Supabase or any Postgres with PostGIS.
 """
 
 import json
 import os
 from typing import List, Optional
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncpg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from shapely.geometry import Polygon, mapping
@@ -27,42 +27,41 @@ from pyproj import Transformer, Geod
 
 app = FastAPI(title="GeoEstate Parcel Plotting — Test Service")
 
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Railway injects this when Postgres is attached
+DATABASE_URL = os.environ.get("DATABASE_URL")  # set manually in Railway Variables for Supabase
 geod = Geod(ellps="WGS84")
 
 
-def get_conn():
-    if not DATABASE_URL:
-        raise HTTPException(500, "DATABASE_URL not set — attach a Postgres plugin on Railway and link it to this service")
-    return psycopg2.connect(DATABASE_URL)
-
-
 @app.on_event("startup")
-def setup_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
-        conn.commit()
-    except Exception as e:
-        # On Supabase, enable PostGIS via Database > Extensions in the dashboard
-        # if this role lacks CREATE EXTENSION rights — safe to ignore once enabled there.
-        conn.rollback()
-        print(f"Skipping CREATE EXTENSION (likely already enabled via dashboard): {e}")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS parcels (
-            id SERIAL PRIMARY KEY,
-            pin TEXT UNIQUE NOT NULL,
-            area_sqm DOUBLE PRECISION,
-            geom GEOMETRY(Polygon, 4326) NOT NULL,
-            created_at TIMESTAMP DEFAULT now()
-        );
-        """
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+async def setup_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set — add your Supabase connection string in Railway Variables")
+
+    app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with app.state.pool.acquire() as conn:
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+        except Exception as e:
+            # On Supabase, enable PostGIS via Database > Extensions in the dashboard
+            # if this role lacks CREATE EXTENSION rights — safe to ignore once enabled there.
+            print(f"Skipping CREATE EXTENSION (likely already enabled via dashboard): {e}")
+
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS parcels (
+                id SERIAL PRIMARY KEY,
+                pin TEXT UNIQUE NOT NULL,
+                area_sqm DOUBLE PRECISION,
+                geom GEOMETRY(Polygon, 4326) NOT NULL,
+                created_at TIMESTAMP DEFAULT now()
+            );
+            """
+        )
+
+
+@app.on_event("shutdown")
+async def shutdown_db():
+    await app.state.pool.close()
 
 
 # ---------- Request / response models ----------
@@ -126,38 +125,29 @@ def geodesic_area(polygon: Polygon):
     return abs(area)
 
 
-def check_overlap(polygon: Polygon) -> bool:
+async def check_overlap(polygon: Polygon) -> bool:
     """Check the candidate polygon against every parcel already in the fabric."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT EXISTS (SELECT 1 FROM parcels WHERE ST_Intersects(geom, ST_GeomFromText(%s, 4326)));",
-        (polygon.wkt,),
-    )
-    overlaps = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-    return overlaps
+    async with app.state.pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM parcels WHERE ST_Intersects(geom, ST_GeomFromText($1, 4326)));",
+            polygon.wkt,
+        )
 
 
-def next_pin() -> str:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM parcels;")
-    n = cur.fetchone()[0]
-    cur.close()
-    conn.close()
+async def next_pin() -> str:
+    async with app.state.pool.acquire() as conn:
+        n = await conn.fetchval("SELECT COUNT(*) FROM parcels;")
     return f"PIN-{n + 1:06d}"
 
 
-def run_pipeline(points, closure_error_m: Optional[float] = None) -> PlotResult:
+async def run_pipeline(points, closure_error_m: Optional[float] = None) -> PlotResult:
     """Shared steps: build polygon -> validate -> check overlap -> report (no save)."""
     polygon = build_polygon(points)
 
     if not polygon.is_valid:
         return PlotResult(valid=False, reason=explain_validity(polygon), closure_error_m=closure_error_m)
 
-    overlaps = check_overlap(polygon)
+    overlaps = await check_overlap(polygon)
     area = geodesic_area(polygon)
 
     return PlotResult(
@@ -173,7 +163,7 @@ def run_pipeline(points, closure_error_m: Optional[float] = None) -> PlotResult:
 # ---------- Endpoints ----------
 
 @app.post("/plot/cogo", response_model=PlotResult)
-def plot_cogo(req: CogoRequest):
+async def plot_cogo(req: CogoRequest):
     """Test COGO traverse -> polygon, without saving. Checks closure first."""
     raw_points = cogo_to_points(req.start_lon, req.start_lat, req.legs)
 
@@ -188,19 +178,19 @@ def plot_cogo(req: CogoRequest):
             closure_error_m=closure_error,
         )
 
-    return run_pipeline(raw_points, closure_error_m=closure_error)
+    return await run_pipeline(raw_points, closure_error_m=closure_error)
 
 
 @app.post("/plot/direct", response_model=PlotResult)
-def plot_direct(req: DirectRequest):
+async def plot_direct(req: DirectRequest):
     """Test direct GPS/import points -> polygon, without saving."""
     points = [(p[0], p[1]) for p in req.points]
     points = transform_points(points, req.source_epsg)
-    return run_pipeline(points)
+    return await run_pipeline(points)
 
 
 @app.post("/parcels")
-def save_parcel(req: DirectRequest):
+async def save_parcel(req: DirectRequest):
     """Validate then persist to the fabric with a PIN."""
     points = [(p[0], p[1]) for p in req.points]
     points = transform_points(points, req.source_epsg)
@@ -208,35 +198,26 @@ def save_parcel(req: DirectRequest):
 
     if not polygon.is_valid:
         raise HTTPException(400, explain_validity(polygon))
-    if check_overlap(polygon):
+    if await check_overlap(polygon):
         raise HTTPException(409, "Overlaps an existing parcel — rejected")
 
-    pin = next_pin()
+    pin = await next_pin()
     area = geodesic_area(polygon)
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO parcels (pin, area_sqm, geom) VALUES (%s, %s, ST_GeomFromText(%s, 4326)) RETURNING id;",
-        (pin, area, polygon.wkt),
-    )
-    parcel_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
+    async with app.state.pool.acquire() as conn:
+        parcel_id = await conn.fetchval(
+            "INSERT INTO parcels (pin, area_sqm, geom) VALUES ($1, $2, ST_GeomFromText($3, 4326)) RETURNING id;",
+            pin, area, polygon.wkt,
+        )
 
     return {"id": parcel_id, "pin": pin, "area_sqm": round(area, 2), "geojson": mapping(polygon)}
 
 
 @app.get("/parcels")
-def list_parcels():
+async def list_parcels():
     """Serve the whole fabric as GeoJSON — paste into geojson.io to see it plotted."""
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT id, pin, area_sqm, ST_AsGeoJSON(geom) as geometry FROM parcels ORDER BY id;")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    async with app.state.pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, pin, area_sqm, ST_AsGeoJSON(geom) as geometry FROM parcels ORDER BY id;")
 
     features = [
         {
@@ -250,17 +231,13 @@ def list_parcels():
 
 
 @app.delete("/parcels")
-def reset_parcels():
+async def reset_parcels():
     """Wipe the test fabric so you can re-run scenarios cleanly."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("TRUNCATE parcels RESTART IDENTITY;")
-    conn.commit()
-    cur.close()
-    conn.close()
+    async with app.state.pool.acquire() as conn:
+        await conn.execute("TRUNCATE parcels RESTART IDENTITY;")
     return {"status": "cleared"}
 
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
