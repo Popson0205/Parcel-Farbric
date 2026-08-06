@@ -19,7 +19,7 @@ import os
 from typing import List, Optional
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 from shapely.geometry import Polygon, mapping
 from shapely.validation import explain_validity
@@ -241,3 +241,8 @@ async def reset_parcels():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
