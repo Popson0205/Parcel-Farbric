@@ -2,7 +2,48 @@
 
 Tests only the plotting pipeline: COGO/direct capture → coordinate transform →
 polygon build → topology validation (self-intersection + overlap) → PostGIS
-storage → GeoJSON out. Nothing else from GeoEstate/GeoCore.
+storage → GeoJSON out. Nothing else from GeoEstate/GeoCore — no management
+dashboard, no auth, no org/project model. That's deliberately out of scope
+here and lives elsewhere.
+
+## Mapping a Nigerian survey plan into this pipeline
+
+Modeled against two real Osun State cadastral plans (Modeseg Survey &
+Properties). This is what's on a plan's title block / traverse table, and
+where it lands in the pipeline:
+
+| On the plan | Field in this service |
+|---|---|
+| Bearing, e.g. `310° 30'` | `Leg.bearing = {deg, min, sec}` (or `bearing_deg` if you already have decimal) |
+| Distance (m) | `Leg.distance_m` |
+| Beacon number, e.g. `SC/OS BB8215JP` | `Leg.to_beacon_id` / `start_beacon_id`, stored per-vertex in a `beacons` table, returned in each fabric feature's `properties.beacons` |
+| `(Cal.)` bearing annotation | `Leg.calculated = true` — flags a computed/back-bearing check rather than a field-measured leg |
+| Corner coordinates (`679829.843mE 887959.725mN`) | `start_x/start_y` (COGO) or `points` (direct), with `source_epsg` telling the service what grid they're on |
+| `ORIGIN: UNIVERSAL ZONE 31` | Resolved via `source_epsg` — see **CRS note** below, this is *not* automatic |
+| GNSS OBSERVATION block (reference station + tie bearing/distance) | `control_tie` — cross-checks your start point against an independently-computed one from the reference station, doesn't move anything |
+| `PLAN NO: OS/2428/2024/031` | `plan_no`, auto-generated as `{PLAN_STATE_CODE}/{PLAN_JOB_NO}/{year}/{serial}` if you don't supply one |
+| `AREA: 1118.152m²` | `meta.surveyed_area_sqm` — cross-checked against the pipeline's own geodesic computation, returned as `area_diff_pct` |
+| Owner(s), village/road, LGA, State, surveyor, firm | `meta.owners/locality/lga/state/surveyor_name/firm_name` — stored, not validated |
+| Existing road / wire fence annotations, key plan | Not modeled — these are context for a human reader, not parcel geometry |
+
+**CRS note — read before transcribing a plan.** Nigerian plans print a zone
+number but never a datum, and it's not safe to assume. Checked against both
+sample plans here: their beacon coordinates only land in Osun State under
+**WGS84 / UTM zone 31N (EPSG:32631)** — under the legacy **Minna / UTM zone
+31N (EPSG:26391)** the same numbers land ~800km away, near the Cameroon
+border. That's consistent with these plans being tied to the state's GNSS
+CORS network (`OS-APPSN`), which broadcasts in WGS84. Older plans not tied
+to a CORS network may still be genuinely on Minna. `GET /crs-options` lists
+what the service supports; **confirm the datum with the surveyor per plan**
+rather than assuming — a wrong guess moves the parcel by ~100-200m without
+producing an error.
+
+**What this doesn't attempt:** OCR/auto-extraction from the plan PDF itself.
+Text pulled from these PDFs comes out in the drawing's spatial layout order,
+not reading order, so leg/bearing/beacon labels arrive jumbled and can't be
+safely auto-paired — transcription has to be done by a person reading the
+actual drawing. The closure check and control-tie check exist specifically
+to catch a bad transcription before it's saved.
 
 ## Testing UI
 
@@ -114,8 +155,68 @@ system library dependency, so this failure mode goes away entirely. Your
 Supabase connection string works as-is — asyncpg understands `sslmode` in
 the URL the same way libpq does.
 
+## Testing with real plan data
+
+**1. COGO from a DMS traverse, with beacon IDs and a control tie:**
+
+```bash
+curl -X POST https://<your-service>/plot/cogo \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_x": 668572.647, "start_y": 866736.599, "source_epsg": 32631,
+    "start_beacon_id": "SC/OS BC6317JP",
+    "legs": [
+      {"bearing": {"deg": 61, "min": 21}, "distance_m": 11.95, "to_beacon_id": "SC/OS BC6318JP"},
+      {"bearing": {"deg": 139, "min": 32}, "distance_m": 28.3,  "to_beacon_id": "SC/OS BC6319JP"},
+      {"bearing": {"deg": 227, "min": 23}, "distance_m": 31.39, "to_beacon_id": "SC/OS BC6320JP", "calculated": true},
+      {"bearing": {"deg": 323, "min": 39}, "distance_m": 13.95, "to_beacon_id": "SC/OS BC6317JP"}
+    ],
+    "closure_tolerance_m": 0.5,
+    "control_tie": {
+      "station_id": "OS-APPSN 01S",
+      "station_x": 668351.770, "station_y": 857149.713, "source_epsg": 32631,
+      "bearing": {"deg": 181, "min": 26}, "distance_m": 9564.61
+    }
+  }'
+```
+
+A large `closure_error_m` or `control_tie.discrepancy_m` in the response
+usually means a leg was mis-transcribed (order, bearing, or which value is
+the distance) — check against the drawing before retrying, not the raw
+extracted PDF text.
+
+**2. Save with the plan's title-block metadata:**
+
+```bash
+curl -X POST https://<your-service>/parcels \
+  -H "Content-Type: application/json" \
+  -d '{
+    "points": [[4.6317,8.0298],[4.6320,8.0298],[4.6320,8.0301],[4.6317,8.0301]],
+    "beacon_ids": ["SC/OS BB8215JP","SC/OS BB8216JP","SC/OS BB8217JP","SC/OS BB8218JP"],
+    "source_epsg": 4326,
+    "meta": {
+      "owners": ["Mr. Emmanuel Oyetunde Fasola", "Mrs. Kemi Oyetunde Fasola"],
+      "locality": "Durodola Village, Odo-Afa Road, Owode-Ede",
+      "lga": "Ede South", "state": "Osun",
+      "surveyor_name": "SURV. A. O. Adeyemo",
+      "firm_name": "Modeseg Survey & Properties Consult",
+      "surveyed_area_sqm": 1118.152
+    }
+  }'
+```
+
+The response includes `area_diff_pct` — the gap between the plan's stated
+area and the pipeline's own geodesic computation.
+
+**3. Plan No. format:** set `PLAN_STATE_CODE` and `PLAN_JOB_NO` in Railway
+Variables (e.g. `OS` and `2428`) to match your office's numbering; the
+service then generates `OS/2428/2026/001`, `.../002`, ... per calendar year.
+Or pass `meta.plan_no` explicitly to use the plan's actual number.
+
 ## What this deliberately leaves out
 
-No auth, no organisations/projects, no PIN format beyond a counter, no
-survey-plan attachment linkage. This is scoped to prove the plotting
-mechanics alone before it's wired into the rest of GeoEstate.
+No auth, no organisations/projects, no survey-plan PDF/image attachment
+linkage (you transcribe the traverse and title block; the file itself isn't
+stored here), no OCR. This is scoped to prove the plotting mechanics — now
+including the Nigerian-plan capture format — before it's wired into the
+rest of GeoEstate. The management dashboard is a separate piece of work.
